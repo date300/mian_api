@@ -1,0 +1,7 @@
+# CloudLinux Passenger Configuration
+PassengerAppRoot "/home/ltcmlgtn/main_api"
+PassengerBaseURI "/api"
+PassengerNodejs "/home/ltcmlgtn/nodevenv/main_api/20/bin/node"
+PassengerAppType node
+PassengerStartupFile server.js
+
