@@ -18,11 +18,18 @@ const MAX_BOOST_USD   = 50;
 const BASE_DAYS       = 360;
 const MIN_DAYS        = 80;
 
+// ================== REFERRAL COMMISSION CONFIG ==================
+// Active = user has done at least one mining_start ($18 entry)
+const REFERRAL_LEVELS = [
+  { level: 1, minReferrals: 10, reward: 2.00 },
+  { level: 2, minReferrals: 5,  reward: 1.50 },
+  { level: 3, minReferrals: 1,  reward: 1.50 },
+];
+
 // ================== SOL PRICE CACHE ==================
-// Cache SOL/USD price so we don't hammer CoinGecko on every /status call
-let _cachedSolPrice   = null;
+let _cachedSolPrice    = null;
 let _solPriceFetchedAt = 0;
-const SOL_CACHE_TTL   = 60 * 1000; // 1 minute
+const SOL_CACHE_TTL    = 60 * 1000;
 
 async function getSolPrice() {
   const now = Date.now();
@@ -39,20 +46,20 @@ async function getSolPrice() {
       res.on('data', (chunk) => (body += chunk));
       res.on('end', () => {
         try {
-          const json = JSON.parse(body);
+          const json  = JSON.parse(body);
           const price = json?.solana?.usd;
           if (price && price > 0) {
             _cachedSolPrice    = price;
             _solPriceFetchedAt = Date.now();
             resolve(price);
           } else {
-            resolve(_cachedSolPrice || 150); // fallback
+            resolve(_cachedSolPrice || 150);
           }
         } catch {
           resolve(_cachedSolPrice || 150);
         }
       });
-    }).on('error', () => resolve(_cachedSolPrice || 150))
+    }).on('error',   () => resolve(_cachedSolPrice || 150))
       .on('timeout', () => resolve(_cachedSolPrice || 150));
   });
 }
@@ -64,23 +71,14 @@ function getEffectiveDays(boostUSD) {
   return BASE_DAYS - (BASE_DAYS - MIN_DAYS) * ratio;
 }
 
-/**
- * Returns how much USD is earned per second.
- * boostUSD  → shortens cycle days (speed boost)
- * ai        → direct multiplier on top
- */
 function getRate(boostUSD, ai = 1) {
   const days = getEffectiveDays(boostUSD);
   return (USD_TARGET / (days * 86400)) * (ai || 1);
 }
 
-/**
- * boostMultiplier for the Flutter UI (how many times faster vs baseline)
- * baseline = BASE_DAYS, boosted = effectiveDays
- */
 function getBoostMultiplier(boostUSD) {
   const days = getEffectiveDays(boostUSD);
-  return BASE_DAYS / days; // e.g. 360/80 = 4.5x at max boost
+  return BASE_DAYS / days;
 }
 
 // ================== HELPER ==================
@@ -92,9 +90,8 @@ function calcCoins(row) {
     : new Date(row.session_start_at).getTime();
 
   const seconds = Math.floor((Date.now() - start) / 1000);
-  const usdRate  = getRate(row.boost_usd, row.ai_multiplier);
+  const usdRate = getRate(row.boost_usd, row.ai_multiplier);
 
-  // coins = seconds * (coins/usd) * (usd/sec)
   return seconds * COINS_PER_USD * usdRate;
 }
 
@@ -117,13 +114,88 @@ async function getMining(userId) {
   return rows[0];
 }
 
+// ================== REFERRAL COMMISSION LOGIC ==================
+/**
+ * যখন একজন user mining start করে ($18 entry দেয়),
+ * তার upline (যে তাকে রেফার করেছে) থেকে শুরু করে ৩ লেভেল পর্যন্ত
+ * commission চেক করে withdrawable-এ যোগ করে।
+ *
+ * Active referral = যে user অন্তত একবার mining_start করেছে।
+ */
+async function processReferralCommission(newUserId) {
+  try {
+    // নতুন user-এর referral_code ও referred_by বের করো
+    const [userRows] = await db.query(
+      `SELECT referral_code, referred_by FROM users WHERE id = ?`,
+      [newUserId]
+    );
+    if (!userRows.length || !userRows[0].referred_by) return;
+
+    let currentReferredBy = userRows[0].referred_by; // level 1 upline-এর referral_code
+
+    for (let i = 0; i < REFERRAL_LEVELS.length; i++) {
+      if (!currentReferredBy) break;
+
+      const { level, minReferrals, reward } = REFERRAL_LEVELS[i];
+
+      // upline user বের করো (referred_by = তার referral_code)
+      const [uplineRows] = await db.query(
+        `SELECT id, referred_by FROM users WHERE referral_code = ?`,
+        [currentReferredBy]
+      );
+      if (!uplineRows.length) break;
+
+      const upline = uplineRows[0];
+
+      // upline-এর কতজন active referral আছে গণনা করো
+      // active = তারা purchase_logs-এ mining_start আছে
+      const [countRows] = await db.query(
+        `SELECT COUNT(DISTINCT pl.user_id) AS active_count
+         FROM users u
+         JOIN purchase_logs pl
+           ON pl.user_id = u.id AND pl.purchase_type = 'mining_start'
+         WHERE u.referred_by = (
+           SELECT referral_code FROM users WHERE id = ?
+         )`,
+        [upline.id]
+      );
+
+      const activeCount = countRows[0]?.active_count || 0;
+
+      if (activeCount >= minReferrals) {
+        // Mining row নিশ্চিত করো (না থাকলে create হবে)
+        await getMining(upline.id);
+
+        // withdrawable-এ reward যোগ করো
+        await db.query(
+          `UPDATE mining SET withdrawable = withdrawable + ? WHERE user_id = ?`,
+          [reward, upline.id]
+        );
+
+        // commission_logs টেবিলে রেকর্ড রাখো
+        await db.query(
+          `INSERT INTO commission_logs
+             (beneficiary_user_id, triggered_by_user_id, level, reward_usd)
+           VALUES (?, ?, ?, ?)`,
+          [upline.id, newUserId, level, reward]
+        );
+      }
+
+      // পরের লেভেলের জন্য upline-এর referred_by নাও
+      currentReferredBy = upline.referred_by;
+    }
+  } catch (err) {
+    // Commission error হলে main flow আটকাবে না, শুধু log করবো
+    console.error('[Referral Commission Error]', err.message);
+  }
+}
+
 // ================== STATUS ==================
 // GET /api/mining/status
 router.get('/status', authMiddleware, async (req, res) => {
   try {
     const m = await getMining(req.userId);
 
-    // Auto-start mining if feature is enabled
     if (!m.mining_active && m.auto_mining) {
       await db.query(`
         UPDATE mining SET
@@ -141,34 +213,25 @@ router.get('/status', authMiddleware, async (req, res) => {
     const liveCoins = m.coins + calcCoins(m);
     const liveUSD   = liveCoins / COINS_PER_USD;
 
-    // Derived multipliers (so Flutter can display them)
-    const boostUSD        = m.boost_usd    || 0;
+    const boostUSD        = m.boost_usd     || 0;
     const aiMultiplier    = m.ai_multiplier || 1;
     const boostMultiplier = getBoostMultiplier(boostUSD);
     const usdPerSec       = getRate(boostUSD, aiMultiplier);
-    // SOL equivalent coins per second
     const solPrice        = await getSolPrice();
     const solPerSec       = usdPerSec / solPrice;
 
     res.json({
-      // Core fields (unchanged)
       miningActive:     !!m.mining_active,
       minedCoins:       Number(liveCoins.toFixed(4)),
       equivalentUSD:    Number(liveUSD.toFixed(6)),
       withdrawableUSD:  Number(m.withdrawable),
       autoMining:       !!m.auto_mining,
-
-      // NEW — multiplier fields Flutter needs
       boostUSD,
-      boostMultiplier:  Number(boostMultiplier.toFixed(4)),  // e.g. 4.5
+      boostMultiplier:  Number(boostMultiplier.toFixed(4)),
       aiMultiplier:     Number(aiMultiplier.toFixed(4)),
-
-      // NEW — live rate fields for real-time UI counter
-      usdPerSec:        Number(usdPerSec.toFixed(8)),        // USD earned/sec
-      solPerSec:        Number(solPerSec.toFixed(10)),        // SOL earned/sec
-      solPriceUSD:      Number(solPrice.toFixed(2)),          // current SOL price
-
-      // NEW — SOL equivalent of total mined so far
+      usdPerSec:        Number(usdPerSec.toFixed(8)),
+      solPerSec:        Number(solPerSec.toFixed(10)),
+      solPriceUSD:      Number(solPrice.toFixed(2)),
       minedSOL:         Number((liveUSD / solPrice).toFixed(8)),
     });
 
@@ -191,6 +254,7 @@ router.post('/start-day', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Need $18 balance" });
     }
 
+    // Mining start করো
     await db.query(`
       UPDATE mining SET
         balance          = balance - ?,
@@ -200,6 +264,16 @@ router.post('/start-day', authMiddleware, async (req, res) => {
         total_sessions   = total_sessions + 1
       WHERE user_id = ?
     `, [ENTRY_FEE, req.userId]);
+
+    // Purchase log করো
+    await db.query(
+      `INSERT INTO purchase_logs (user_id, purchase_type, amount_usd)
+       VALUES (?, 'mining_start', ?)`,
+      [req.userId, ENTRY_FEE]
+    );
+
+    // Referral commission process করো (async, main flow block করবে না)
+    processReferralCommission(req.userId);
 
     res.json({ message: "Mining started" });
 
@@ -227,11 +301,10 @@ router.post('/claim', authMiddleware, async (req, res) => {
 
     const earned = calcCoins(m);
 
-    let coins      = m.coins + earned;
+    let coins        = m.coins + earned;
     let withdrawable = m.withdrawable;
-    let active     = m.mining_active;
+    let active       = m.mining_active;
 
-    // Multiple cycle support
     while (coins >= COIN_TARGET) {
       withdrawable += USD_TARGET;
       coins        -= COIN_TARGET;
@@ -279,16 +352,23 @@ router.post('/buy-boost', authMiddleware, async (req, res) => {
 
     await db.query(`
       UPDATE mining SET
-        balance  = balance - ?,
+        balance   = balance - ?,
         boost_usd = ?
       WHERE user_id = ?
     `, [amount, newBoost, req.userId]);
 
+    // Purchase log (commission ভবিষ্যতে)
+    await db.query(
+      `INSERT INTO purchase_logs (user_id, purchase_type, amount_usd)
+       VALUES (?, 'boost', ?)`,
+      [req.userId, amount]
+    );
+
     const newMultiplier = getBoostMultiplier(newBoost);
 
     res.json({
-      message:        "Boost added",
-      boost:          newBoost,
+      message:         "Boost added",
+      boost:           newBoost,
       boostMultiplier: Number(newMultiplier.toFixed(4)),
     });
 
@@ -318,6 +398,13 @@ router.post('/buy-auto', authMiddleware, async (req, res) => {
       WHERE user_id = ?
     `, [req.userId]);
 
+    // Purchase log (commission ভবিষ্যতে)
+    await db.query(
+      `INSERT INTO purchase_logs (user_id, purchase_type, amount_usd)
+       VALUES (?, 'auto_mining', 10)`,
+      [req.userId]
+    );
+
     res.json({ message: "Auto mining enabled" });
 
   } catch (err) {
@@ -326,7 +413,7 @@ router.post('/buy-auto', authMiddleware, async (req, res) => {
 });
 
 // ================== SOL PRICE (public) ==================
-// GET /api/mining/sol-price  — lightweight endpoint for price-only refresh
+// GET /api/mining/sol-price
 router.get('/sol-price', async (req, res) => {
   try {
     const price = await getSolPrice();

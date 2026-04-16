@@ -4,34 +4,30 @@ const express = require('express');
 const cors = require('cors');
 
 // Routes
-const authRoutes   = require('./routes/auth.routes');
-const userRoutes   = require('./routes/user.routes');
-const miningRoutes = require('./routes/mining.routes'); // ✅
-const depositRoutes = require('./routes/deposit.routes'); // ✅
-// DB (MySQL pool)
-const db = require('./config/db'); // ✅
+const authRoutes = require('./routes/auth.routes');
+const userRoutes = require('./routes/user.routes');
+const miningRoutes = require('./routes/mining.routes');
+const depositRoutes = require('./routes/deposit.crypto.routes');
+const referralRouter = require('./routes/refer.routes');
+// DB
+const db = require('./config/db');
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+const app = express();
 
-// ── Middleware ─────────────────────────────────────
+// ── PORT (IMPORTANT: ONLY ONE) ──
+const PORT = process.env.PORT || 3001;
+
+// ── Middleware ──
 app.use(cors());
 app.use(express.json());
 
-// ── Routes ─────────────────────────────────────────
-
-// Auth API
+// ── Routes ──
 app.use('/api/auth', authRoutes);
-
-// User API
 app.use('/api/user', userRoutes);
-
-// Mining API
-app.use('/api/mining', miningRoutes); 
-
+app.use('/api/mining', miningRoutes);
 app.use('/api/deposit', depositRoutes);
-
-// ── Health check ───────────────────────────────────
+app.use('/api/referral', referralRouter);
+// ── Health Check ──
 app.get('/', async (req, res) => {
   try {
     await db.query('SELECT 1');
@@ -50,7 +46,7 @@ app.get('/', async (req, res) => {
   }
 });
 
-// ── Start ──────────────────────────────────────────
+// ── Start Server ──
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
