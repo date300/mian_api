@@ -1,0 +1,144 @@
+const express = require('express');
+const router  = express.Router();
+const axios   = require('axios');
+const db      = require('../config/db');
+const authMiddleware = require('../middlewares/auth.middleware');
+
+// ── CONFIG (Move these to .env file later) ──────────────────────────
+const BEP20_WALLET = process.env.BEP20_WALLET || "0xYourActualWalletAddress";
+const TRC20_WALLET = process.env.TRC20_WALLET || "YourActualTronWalletAddress";
+
+const BEP20_USDT = "0x55d398326f99059ff775485246999027b3197955";
+const TRC20_USDT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
+
+const MIN_DEPOSIT = 1.0; 
+const BSC_CONFIRMATIONS_REQUIRED = 12; // নূন্যতম ১২টি কনফার্মেশন
+
+// ── BEP20 VERIFY (UPGRADED) ─────────────────
+async function verifyBEP20(txHash) {
+  const url = `https://api.bscscan.com/api?module=account&action=tokentx&txhash=${txHash}&apikey=${process.env.BSCSCAN_API_KEY}`;
+  
+  const { data } = await axios.get(url);
+
+  if (data.status !== "1" || !data.result || data.result.length === 0) {
+    throw new Error("Transaction not found or failed on BscScan");
+  }
+
+  // অনেক সময় একটা হ্যাশে একাধিক ট্রান্সফার থাকে, তাই আমাদের ওয়ালেটেরটা খুঁজে বের করা
+  const tx = data.result.find(t => t.to.toLowerCase() === BEP20_WALLET.toLowerCase());
+
+  if (!tx) throw new Error("Receiver address mismatch");
+  if (tx.contractAddress.toLowerCase() !== BEP20_USDT.toLowerCase()) throw new Error("Not a USDT transaction");
+  
+  // চেক: ট্রানজেকশনটি কি সফল হয়েছে?
+  if (tx.confirmations < BSC_CONFIRMATIONS_REQUIRED) {
+    throw new Error(`Wait for ${BSC_CONFIRMATIONS_REQUIRED} confirmations (Current: ${tx.confirmations})`);
+  }
+
+  const amount = Number(tx.value) / Math.pow(10, tx.tokenDecimal);
+  return amount;
+}
+
+// ── TRC20 VERIFY (UPGRADED) ─────────────────
+async function verifyTRC20(txHash) {
+  // ১. ট্রানজেকশন স্ট্যাটাস চেক (Success কিনা)
+  const infoUrl = `https://api.trongrid.io/wallet/gettransactioninfobyid`;
+  const infoRes = await axios.post(infoUrl, { value: txHash }, {
+    headers: { "TRON-PRO-API-KEY": process.env.TRONGRID_API_KEY }
+  });
+
+  if (!infoRes.data || infoRes.data.result === "FAILED") {
+    throw new Error("Transaction failed on TRON network");
+  }
+
+  // ২. ইভেন্ট চেক (পয়সা কার কাছে গেছে)
+  const eventUrl = `https://api.trongrid.io/v1/transactions/${txHash}/events`;
+  const { data } = await axios.get(eventUrl, {
+    headers: { "TRON-PRO-API-KEY": process.env.TRONGRID_API_KEY }
+  });
+
+  if (!data.data || data.data.length === 0) throw new Error("No events found");
+
+  const event = data.data.find(e => e.contract_address === TRC20_USDT && e.type === "Transfer");
+
+  if (!event) throw new Error("Not a valid TRC20 USDT transfer");
+  
+  // TRON-এ অ্যাড্রেস Case Sensitive, তাই সরাসরি চেক করা ভালো
+  if (event.result.to !== TRC20_WALLET) {
+    throw new Error("Wrong receiver wallet address");
+  }
+
+  const amount = Number(event.result.value) / 1e6; // USDT has 6 decimals
+  return amount;
+}
+
+// ── MAIN API ────────────────────
+router.post('/verify', authMiddleware, async (req, res) => {
+  const { txHash, network } = req.body;
+
+  if (!txHash || !network) {
+    return res.status(400).json({ error: "Transaction Hash & Network are required" });
+  }
+
+  const conn = await db.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    // ১. ডুপ্লিকেট চেক (Prevent Replay Attack)
+    const [exist] = await conn.query("SELECT id FROM deposits WHERE tx_hash = ?", [txHash]);
+    if (exist.length > 0) {
+      await conn.rollback();
+      return res.status(400).json({ error: "This transaction has already been used" });
+    }
+
+    let amount = 0;
+
+    if (network === "BEP20") {
+      amount = await verifyBEP20(txHash);
+    } else if (network === "TRC20") {
+      amount = await verifyTRC20(txHash);
+    } else {
+      await conn.rollback();
+      return res.status(400).json({ error: "Unsupported network" });
+    }
+
+    if (amount < MIN_DEPOSIT) {
+      await conn.rollback();
+      return res.status(400).json({ error: `Minimum deposit is $${MIN_DEPOSIT}` });
+    }
+
+    // ২. ডিপোজিট রেকর্ড সেভ
+    await conn.query(
+      `INSERT INTO deposits (user_id, tx_hash, amount, network, status, created_at) 
+       VALUES (?, ?, ?, ?, 'confirmed', NOW())`,
+      [req.userId, txHash, amount, network]
+    );
+
+    // ৩. ইউজারের মেইন ব্যালেন্স আপডেট
+    // (ধরে নিচ্ছি আপনার 'mining' টেবিলের 'balance' কলামে টাকা যোগ হবে)
+    await conn.query(
+      `INSERT INTO mining (user_id, balance) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE balance = balance + VALUES(balance)`,
+      [req.userId, amount]
+    );
+
+    await conn.commit();
+
+    return res.json({
+      success: true,
+      amount: parseFloat(amount.toFixed(2)),
+      message: `Deposit successful! $${amount.toFixed(2)} added to your account.`
+    });
+
+  } catch (err) {
+    if (conn) await conn.rollback();
+    console.error("Deposit Error:", err.message);
+    return res.status(500).json({ error: err.message || "Internal Server Error" });
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+module.exports = router;
+
