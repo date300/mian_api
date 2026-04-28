@@ -4,7 +4,8 @@ const db      = require('../config/db');
 const authMiddleware = require('../middlewares/auth.middleware');
 
 // ================== CONFIG ==================
-const BASE_URL = process.env.APP_BASE_URL || 'https://yourdomain.com';
+const BASE_URL = process.env.APP_BASE_URL || 
+'https://ltcminematrix.com';
 
 const REFERRAL_LEVELS = [
   { level: 1, minReferrals: 10, reward: 2.00,  label: 'Level 1' },
@@ -101,7 +102,7 @@ router.get('/stats', authMiddleware, async (req, res) => {
     const me = userRows[0];
 
     // Referral link
-    const referralLink = `${BASE_URL}/register?ref=${me.referral_code}`;
+    const referralLink = `${BASE_URL}?ref=${me.referral_code}`;
 
     // ---- Level 1 ----
     const l1List   = await getDirectReferrals(req.userId);
