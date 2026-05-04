@@ -8,6 +8,7 @@ const authRoutes = require('./routes/auth.routes');
 const userRoutes = require('./routes/user.routes');
 const miningRoutes = require('./routes/mining.routes');
 const depositRoutes = require('./routes/deposit.crypto.routes');
+const withdrawRoutes = require('./routes/withdraw.routes');
 const referralRouter = require('./routes/refer.routes');
 // DB
 const db = require('./config/db');
@@ -27,6 +28,7 @@ app.use('/api/user', userRoutes);
 app.use('/api/mining', miningRoutes);
 app.use('/api/deposit', depositRoutes);
 app.use('/api/referral', referralRouter);
+app.use('/api/withdraw', withdrawRoutes);
 // ── Health Check ──
 app.get('/', async (req, res) => {
   try {
