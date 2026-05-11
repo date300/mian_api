@@ -1,12 +1,12 @@
 const express = require('express');
-const router  = express.Router();
-const db      = require('../config/db');
+const router = express.Router();
+const db = require('../config/db');
 const authMiddleware = require('../middlewares/auth.middleware');
 
 // ── CONFIG ──────────────────────────
 const MIN_WITHDRAW = 5;
 const MAX_WITHDRAW = 10000;
-
+const ALLOWED_NETWORKS = ['BEP20', 'TRC20'];
 
 // ── ADMIN MIDDLEWARE ────────────────
 const adminMiddleware = async (req, res, next) => {
@@ -24,18 +24,58 @@ const adminMiddleware = async (req, res, next) => {
   }
 };
 
+// ── HELPER: wallet validation ───────
+function isValidWallet(wallet, network) {
+  if (network === 'BEP20') {
+    // Ethereum style: 0x + 40 hex chars (case-insensitive)
+    return /^0x[a-fA-F0-9]{40}$/.test(wallet);
+  }
+  if (network === 'TRC20') {
+    // Tron base58check starting with T, 34 chars
+    return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(wallet);
+  }
+  return false;
+}
 
+// ── ROUTE: GET WITHDRAWABLE BALANCE (no coins) ─
+router.get('/withdraw/balance', authMiddleware, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      "SELECT balance, withdrawable FROM mining WHERE user_id = ? LIMIT 1",
+      [req.userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Mining account not found" });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        balance: Number(rows[0].balance),
+        withdrawable: Number(rows[0].withdrawable)
+      }
+    });
+  } catch (err) {
+    console.error("Balance fetch error:", err);
+    return res.status(500).json({ error: "Failed to fetch balance" });
+  }
+});
 
 // ── ROUTE: REQUEST WITHDRAW ─────────
 router.post('/withdraw', authMiddleware, async (req, res) => {
-  const { amount, wallet } = req.body;
+  const { amount, wallet, network = 'BEP20' } = req.body;
 
   if (!amount || isNaN(amount) || amount <= 0) {
     return res.status(400).json({ error: "Invalid amount" });
   }
 
-  if (!wallet || !/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
-    return res.status(400).json({ error: "Invalid wallet address" });
+  if (!wallet || !isValidWallet(wallet, network)) {
+    return res.status(400).json({ error: `Invalid wallet address for ${network}` });
+  }
+
+  if (!ALLOWED_NETWORKS.includes(network)) {
+    return res.status(400).json({ error: "Unsupported network" });
   }
 
   if (amount < MIN_WITHDRAW) {
@@ -64,7 +104,7 @@ router.post('/withdraw', authMiddleware, async (req, res) => {
 
     await conn.beginTransaction();
 
-    // deduct safely (race-condition safe)
+    // Deduct (race‑condition safe)
     const [update] = await conn.query(
       `UPDATE mining 
        SET withdrawable = withdrawable - ? 
@@ -76,12 +116,12 @@ router.post('/withdraw', authMiddleware, async (req, res) => {
       throw new Error("Withdraw failed (retry)");
     }
 
-    // insert withdraw request
+    // Insert withdrawal request
     const [insert] = await conn.query(
       `INSERT INTO withdraws 
        (user_id, amount, wallet_address, network, status)
-       VALUES (?, ?, ?, 'BEP20', 'pending')`,
-      [req.userId, amount, wallet]
+       VALUES (?, ?, ?, ?, 'pending')`,
+      [req.userId, amount, wallet, network]
     );
 
     await conn.commit();
@@ -92,6 +132,7 @@ router.post('/withdraw', authMiddleware, async (req, res) => {
         withdrawId: insert.insertId,
         amount,
         wallet,
+        network,
         status: "pending"
       },
       message: "Withdraw request submitted"
@@ -107,8 +148,6 @@ router.post('/withdraw', authMiddleware, async (req, res) => {
     conn.release();
   }
 });
-
-
 
 // ── ROUTE: ADMIN APPROVE ────────────
 router.post('/admin/withdraw/approve', authMiddleware, adminMiddleware, async (req, res) => {
@@ -128,7 +167,7 @@ router.post('/admin/withdraw/approve', authMiddleware, adminMiddleware, async (r
     );
 
     if (!rows.length) {
-      return res.status(404).json({ error: "Withdraw not found" });
+      return res.status(404).json({ error: "Withdraw not found or not pending" });
     }
 
     await conn.beginTransaction();
@@ -155,8 +194,6 @@ router.post('/admin/withdraw/approve', authMiddleware, adminMiddleware, async (r
   }
 });
 
-
-
 // ── ROUTE: ADMIN REJECT ─────────────
 router.post('/admin/withdraw/reject', authMiddleware, adminMiddleware, async (req, res) => {
   const { withdrawId, reason } = req.body;
@@ -182,7 +219,7 @@ router.post('/admin/withdraw/reject', authMiddleware, adminMiddleware, async (re
 
     await conn.beginTransaction();
 
-    // refund withdrawable
+    // Refund withdrawable
     await conn.query(
       `UPDATE mining 
        SET withdrawable = withdrawable + ? 
@@ -190,6 +227,7 @@ router.post('/admin/withdraw/reject', authMiddleware, adminMiddleware, async (re
       [w.amount, w.user_id]
     );
 
+    // Mark rejected (approved_at reused for status change time – later you can rename)
     await conn.query(
       `UPDATE withdraws 
        SET status = 'rejected', rejected_reason = ?, approved_at = NOW() 
@@ -212,12 +250,9 @@ router.post('/admin/withdraw/reject', authMiddleware, adminMiddleware, async (re
   }
 });
 
-
-
 // ── ROUTE: USER HISTORY ─────────────
 router.get('/withdraw/history', authMiddleware, async (req, res) => {
   const userId = req.userId;
-
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 10;
   const offset = (page - 1) * limit;
@@ -243,8 +278,6 @@ router.get('/withdraw/history', authMiddleware, async (req, res) => {
     });
   }
 });
-
-
 
 // ── ROUTE: SINGLE WITHDRAW ──────────
 router.get('/withdraw/:id', authMiddleware, async (req, res) => {
@@ -272,6 +305,5 @@ router.get('/withdraw/:id', authMiddleware, async (req, res) => {
     });
   }
 });
-
 
 module.exports = router;

@@ -23,12 +23,15 @@ app.use(cors());
 app.use(express.json());
 
 // ── Routes ──
+// ── Routes ──
 app.use('/api/auth', authRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/mining', miningRoutes);
-app.use('/api/deposit', depositRoutes);
+app.use('/api/deposit', depositRoutes);      // ← সঠিক
+app.use('/api', withdrawRoutes);    // ← সঠিক করা হয়েছে
 app.use('/api/referral', referralRouter);
-app.use('/api/withdraw', withdrawRoutes);
+
+
 // ── Health Check ──
 app.get('/', async (req, res) => {
   try {
